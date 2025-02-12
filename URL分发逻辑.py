@@ -1,6 +1,10 @@
 import redis
 import time
 import logging
+import threading
+import signal
+import sys
+import argparse
 
 
 class URLDistributor:
@@ -17,9 +21,15 @@ class URLDistributor:
         self.redis_db = redis_db
         self.queue_name = queue_name
         self.redis_client = None
+        self.running = False  # 控制线程运行的标志
 
         # 初始化 Redis 连接
-        self.connect_to_redis()
+        if not self.connect_to_redis():
+            raise RuntimeError("Failed to connect to Redis.")
+
+        # 注册信号处理函数
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
 
     def connect_to_redis(self, retries: int = 5, delay: int = 2) -> bool:
         """
@@ -30,18 +40,23 @@ class URLDistributor:
         """
         for i in range(retries):
             try:
-                self.redis_client = redis.Redis(host=self.redis_host, port=self.redis_port, db=self.redis_db, decode_responses=True)
+                self.redis_client = redis.Redis(
+                    host=self.redis_host,
+                    port=self.redis_port,
+                    db=self.redis_db,
+                    decode_responses=True
+                )
                 # 测试连接是否有效
                 self.redis_client.ping()
                 logging.info("Connected to Redis successfully.")
+                return True  # 连接成功
             except redis.RedisError as e:
-                return True
                 logging.error(f"Attempt {i + 1}/{retries} to connect to Redis failed: {e}")
                 time.sleep(delay)
-        logging.critical("Failed to connect to Redis after several attempts. Exiting...")
-        return False
+        logging.critical("Failed to connect to Redis after several attempts.")
+        return False  # 连接失败
 
-    def get_next_url(self, timeout: int = 5) :
+    def get_next_url(self, timeout: int = 5):
         """
         从 Redis 队列中获取下一个 URL（阻塞操作）
         :param timeout: 阻塞超时时间（秒）
@@ -51,59 +66,153 @@ class URLDistributor:
             # 使用 blpop 阻塞获取队列元素，直到有元素或超时
             url_item = self.redis_client.blpop(self.queue_name, timeout=timeout)
             if url_item:
-                return url_item[1].decode('utf-8')  # 返回 URL 部分
-            logging.info("Queue is empty. Waiting for new URLs...")#空的情况，等待新的URL
+                return url_item[1]  # 返回 URL 部分
+            logging.info("Queue is empty. Waiting for new URLs...")
             return None
         except redis.RedisError as e:
             logging.error(f"Failed to get URL from Redis: {e}")
             return None
 
-    def distribute_urls(self, num_workers: int = 3):
+    def distribute_urls(self, num_workers: int = 3, heartbeat_interval: int = 60):
         """
-        将 URL 分发给多个爬虫进程或线程
+        将 URL 分发给多个爬虫进程或线程，并定期检查 Redis 连接
         :param num_workers: 爬虫进程/线程的数量
+        :param heartbeat_interval: 心跳检查间隔（秒）
         """
-        worker_id = 0
-        while True:
-            url = self.get_next_url()
-            if url:
-                try:
-                    # 模拟轮询分发到不同的爬虫
-                    logging.info(f"Worker {worker_id} processing URL: {url}")
-                    worker_id = (worker_id + 1) % num_workers  # 轮询分发爬虫
-                except Exception as e:
-                    logging.error(f"Failed to process URL {url}: {e}")
-            else:
-                logging.info("Queue is empty. Waiting for new URLs...")
-                time.sleep(1)  # 如果队列为空，等待 1 秒后重试
+        self.running = True
+
+        def worker(worker_id):
+            """
+            工作线程函数，处理 URL
+            """
+            last_heartbeat = time.time()
+            while self.running:
+                # 定期检查 Redis 连接
+                if time.time() - last_heartbeat > heartbeat_interval:
+                    if not self.redis_client.ping():
+                        logging.error(f"Worker {worker_id} lost connection to Redis. Reconnecting...")
+                        self.connect_to_redis()
+                    last_heartbeat = time.time()
+
+                url = self.get_next_url()
+                if url:
+                    try:
+                        logging.info(f"Worker {worker_id} processing URL: {url}")
+                        # 这里可以调用实际的爬虫逻辑
+                        self.process_url(url)  # 处理 URL
+                    except Exception as e:
+                        logging.error(f"Worker {worker_id} failed to process URL {url}: {e}")
+                else:
+                    logging.info(f"Worker {worker_id} is idle. Waiting for new URLs...")
+                    time.sleep(1)  # 如果队列为空，等待 1 秒后重试
+
+        # 创建并启动多个工作线程
+        threads = []
+        for i in range(num_workers):
+            thread = threading.Thread(target=worker, args=(i,))
+            thread.start()
+            threads.append(thread)
+
+        # 等待所有线程完成（通常不会结束）
+        for thread in threads:
+            thread.join()
+
+    def process_url(self, url: str):
+        """
+        处理 URL 并将结果存储到 Redis
+        :param url: 要处理的 URL
+        """
+        try:
+            # 模拟 URL 处理逻辑
+            result = f"Processed {url}"
+            self.redis_client.hset("url_results", url, result)
+            logging.info(f"URL processed: {url}")
+        except Exception as e:
+            logging.error(f"Failed to process URL {url}: {e}")
 
     def add_url_to_queue(self, url: str):
         """
-        将 URL 添加到 Redis 队列中
+        将 URL 添加到 Redis 队列中，并确保 URL 不重复
         :param url: 要添加的 URL
         """
         try:
-            self.redis_client.rpush(self.queue_name, url)
-            logging.info(f"URL added to queue: {url}")
+            if not self.redis_client.sismember("processed_urls", url):
+                self.redis_client.rpush(self.queue_name, url)
+                self.redis_client.sadd("processed_urls", url)
+                logging.info(f"URL added to queue: {url}")
+            else:
+                logging.info(f"URL already processed: {url}")
         except redis.RedisError as e:
             logging.error(f"Failed to add URL to queue: {e}")
+
+    def add_urls_from_file(self, file_path: str):
+        """
+        从文件中读取 URL 并添加到队列中
+        :param file_path: 文件路径
+        """
+        try:
+            with open(file_path, 'r') as file:
+                for line in file:
+                    url = line.strip()
+                    if url:
+                        self.add_url_to_queue(url)
+            logging.info(f"URLs from {file_path} added to queue.")
+        except Exception as e:
+            logging.error(f"Failed to read URLs from file {file_path}: {e}")
+
+    def close(self):
+        """
+        关闭 Redis 连接
+        """
+        if self.redis_client:
+            self.redis_client.close()
+            logging.info("Redis connection closed.")
+
+    def signal_handler(self, signum, frame):
+        """
+        处理终止信号，优雅退出
+        """
+        logging.info(f"Received signal {signum}. Shutting down...")
+        self.running = False
+        self.close()
+        sys.exit(0)
 
 
 if __name__ == '__main__':
     # 配置日志
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # 创建 URLDistributor 实例
-    distributor = URLDistributor()
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="URL Distributor")
+    parser.add_argument('--redis_host', type=str, default='localhost', help='Redis server address')
+    parser.add_argument('--redis_port', type=int, default=6379, help='Redis server port')
+    parser.add_argument('--redis_db', type=int, default=0, help='Redis database number')
+    parser.add_argument('--queue_name', type=str, default='url_queue', help='Redis queue name')
+    parser.add_argument('--num_workers', type=int, default=3, help='Number of worker threads')
+    parser.add_argument('--url_file', type=str, default=None, help='Path to file containing URLs')
+    args = parser.parse_args()
 
-    # 如果连接到 Redis 成功，则开始 URL 分发
-    if distributor.redis_client:
-        #添加一些 URL 到队列
+    # 创建 URLDistributor 实例
+    distributor = URLDistributor(
+        redis_host=args.redis_host,
+        redis_port=args.redis_port,
+        redis_db=args.redis_db,
+        queue_name=args.queue_name
+    )
+
+    # 添加 URL 到队列
+    if args.url_file:
+        distributor.add_urls_from_file(args.url_file)
+    else:
         urls_to_add = [
-            
+            "https://quotes.toscrape.com/",
+            "https://www.example.com/",
+            "https://www.test.com/",
+            "https://www.demo.com/",
+            "https://www.sample.com/",
         ]
         for url in urls_to_add:
             distributor.add_url_to_queue(url)
 
-        # 开始分发 URL
-        distributor.distribute_urls(num_workers=3)
+    # 开始分发 URL
+    distributor.distribute_urls(num_workers=args.num_workers)

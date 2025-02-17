@@ -5,6 +5,7 @@ import json
 import logging
 import pandas as pd
 import importlib.util
+import time
 
 # 配置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12,19 +13,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # 使用会话复用
 session = requests.Session()
 
+# 配置重试参数
+REDIS_MAX_RETRIES = 3
+REDIS_RETRY_DELAY = 5  # 秒
+REQUEST_MAX_RETRIES = 3
+REQUEST_TIMEOUT = 10  # 秒
+
 def fetch_page_content(url):
     """
-    从指定 URL 获取网页内容
+    从指定 URL 获取网页内容，添加重试机制
     :param url: 要请求的 URL
     :return: 网页的 HTML 内容，如果请求失败则返回 None
     """
-    try:
-        response = session.get(url)
-        response.raise_for_status()  # 检查请求是否成功
-        return response.text
-    except requests.RequestException as e:
-        logging.error(f"请求 {url} 时出现错误: {e}")
-        return None
+    retries = 0
+    while retries < REQUEST_MAX_RETRIES:
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()  # 检查请求是否成功
+            return response.text
+        except requests.RequestException as e:
+            logging.error(f"请求 {url} 时出现错误 (尝试第 {retries + 1} 次): {e}")
+            retries += 1
+            if retries < REQUEST_MAX_RETRIES:
+                time.sleep(1)  # 等待 1 秒后重试
+    logging.error(f"请求 {url} 失败，已达到最大重试次数。")
+    return None
 
 def load_extraction_rules():
     """
@@ -111,15 +124,18 @@ def process_url(url, rules):
     :param rules: 提取规则字典
     :return: 清洗后的数据列表
     """
-    html_content = fetch_page_content(url)
-    if html_content:
-        extracted_data = extract_data(html_content, url, rules)
-        cleaned_data = clean_data(extracted_data)
-        save_to_json(cleaned_data, url)
-        # 手动释放不再使用的变量
-        html_content = None
-        extracted_data = None
-        return cleaned_data
+    try:
+        html_content = fetch_page_content(url)
+        if html_content:
+            extracted_data = extract_data(html_content, url, rules)
+            cleaned_data = clean_data(extracted_data)
+            save_to_json(cleaned_data, url)
+            # 手动释放不再使用的变量
+            html_content = None
+            extracted_data = None
+            return cleaned_data
+    except Exception as e:
+        logging.error(f"处理 URL {url} 时出现错误: {e}")
     return []
 
 if __name__ == "__main__":
@@ -129,13 +145,22 @@ if __name__ == "__main__":
     spec.loader.exec_module(RedisURLQueueModule)
     RedisURLQueue = RedisURLQueueModule.RedisURLQueue
 
-    # 连接到 Redis 队列
-    try:
-        queue = RedisURLQueue(host='localhost', port=6379, db=0)
-        logging.info("Connected to Redis successfully!")
-    except Exception as e:
-        logging.error(f"Failed to connect to Redis: {e}")
-        raise
+    # 连接到 Redis 队列，添加重试机制
+    retries = 0
+    while retries < REDIS_MAX_RETRIES:
+        try:
+            queue = RedisURLQueue(host='localhost', port=6379, db=0)
+            logging.info("Connected to Redis successfully!")
+            break
+        except Exception as e:
+            logging.error(f"Failed to connect to Redis (尝试第 {retries + 1} 次): {e}")
+            retries += 1
+            if retries < REDIS_MAX_RETRIES:
+                logging.info(f"将在 {REDIS_RETRY_DELAY} 秒后重试...")
+                time.sleep(REDIS_RETRY_DELAY)
+    if retries == REDIS_MAX_RETRIES:
+        logging.error("Failed to connect to Redis after multiple attempts. Exiting.")
+        raise SystemExit(1)
 
     # 加载提取规则
     extraction_rules = load_extraction_rules()

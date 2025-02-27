@@ -9,6 +9,16 @@ import logging
 import pandas as pd
 import importlib.util
 from bs4 import BeautifulSoup
+from pymongo import IndexModel, ASCENDING
+from DNS解析模块 import DNSResolver  # 导入 DNS 解析模块
+
+# 初始化 DNS 解析器
+dns_resolver = DNSResolver()
+
+# 使用解析器解析 URL
+ip = dns_resolver.resolve_url("example.com")
+print("Resolved IP:", ip)
+
 
 # 配置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,6 +39,11 @@ from config import *
 client = pymongo.MongoClient(MONGO_URI)
 db = client[MONGO_DB]
 item_id = set()
+
+# 在 MongoDB 集合中创建索引
+db[MONGO_TABLE].create_index([("url", ASCENDING)], unique=True)  # URL 唯一索引
+db[MONGO_TABLE].create_index([("title", ASCENDING)])  # Title 索引
+db[MONGO_TABLE].create_index([("timestamp", ASCENDING)])  # Timestamp 索引
 
 def get_proxy():
     '''
@@ -201,12 +216,19 @@ def save_to_json(data, url):
 
 def process_url(url, rules):
     """
-    处理单个 URL，包括获取内容、提取数据和清洗数据
+    处理单个 URL，包括获取内容、解析 DNS、提取数据和清洗数据
     :param url: 要处理的 URL
     :param rules: 提取规则字典
     :return: 清洗后的数据列表
     """
     try:
+        # 获取 URL 的 IP 地址
+        ip = dns_resolver.resolve_url(url)
+        if ip:
+            print(f"Resolving IP for {url}: {ip}")
+        else:
+            print(f"Failed to resolve IP for {url}")
+
         html_content = fetch_page_content(url)
         if html_content:
             extracted_data = extract_data(html_content, url, rules)
@@ -215,13 +237,11 @@ def process_url(url, rules):
                 save_to_mongo(cleaned_data)
             else:
                 save_to_json(cleaned_data, url)
-            # 手动释放不再使用的变量
-            html_content = None
-            extracted_data = None
             return cleaned_data
     except Exception as e:
         logging.error(f"处理 URL {url} 时出现错误: {e}")
     return []
+
 
 if __name__ == "__main__":
     # 动态导入 RedisURLQueue 类

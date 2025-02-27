@@ -5,7 +5,7 @@ import threading
 import signal
 import sys
 import argparse
-
+import requests
 
 class URLDistributor:
     def __init__(self, redis_host: str = 'localhost', redis_port: int = 6379, redis_db: int = 0, queue_name: str = 'url_queue'):
@@ -85,7 +85,10 @@ class URLDistributor:
             """
             工作线程函数，处理 URL
             """
-            last_heartbeat = time.time()
+            last_heartbeat = time.time()  # 上次 Redis 心跳时间
+            status_heartbeat = time.time()  # 上次状态更新时间
+            status_interval = 60  # 定期更新爬虫状态的时间间隔（秒）
+
             while self.running:
                 # 定期检查 Redis 连接
                 if time.time() - last_heartbeat > heartbeat_interval:
@@ -94,11 +97,21 @@ class URLDistributor:
                         self.connect_to_redis()
                     last_heartbeat = time.time()
 
+                # 定期发送爬虫状态更新请求
+                if time.time() - status_heartbeat > status_interval:  # 每隔一定时间更新一次状态
+                    try:
+                        # 向 Flask API 发送 POST 请求，更新爬虫状态
+                        requests.post("http://localhost:5001/update_status", json={"worker_id": worker_id})
+                        logging.info(f"Worker {worker_id} status updated.")
+                    except requests.RequestException as e:
+                        logging.error(f"Failed to update status for worker {worker_id}: {e}")
+                    status_heartbeat = time.time()  # 更新状态心跳时间
+
+                # 获取 URL 并处理
                 url = self.get_next_url()
                 if url:
                     try:
                         logging.info(f"Worker {worker_id} processing URL: {url}")
-                        # 这里可以调用实际的爬虫逻辑
                         self.process_url(url)  # 处理 URL
                     except Exception as e:
                         logging.error(f"Worker {worker_id} failed to process URL {url}: {e}")

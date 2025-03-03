@@ -10,7 +10,7 @@ import pandas as pd
 import importlib.util
 from bs4 import BeautifulSoup
 from pymongo import IndexModel, ASCENDING
-from DNS解析模块 import DNSResolver  # 导入 DNS 解析模块
+from DNS_extraction import DNSResolver  # 导入 DNS 解析模块
 
 # 初始化 DNS 解析器
 dns_resolver = DNSResolver()
